@@ -414,8 +414,32 @@ export default function App() {
     setGenerating(true);
     setGlobalError(null);
 
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      setGenerating(false);
+      setGlobalError(
+        "El navegador bloqueó la ventana de impresión. Permite las ventanas emergentes para este sitio e inténtalo de nuevo.",
+      );
+      return;
+    }
+
+    printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Imprimir PDFs</title><style>
+      html,body{margin:0;padding:0;background:#fff;font-family:-apple-system,sans-serif;}
+      .loading{padding:40px;text-align:center;color:#666;}
+      .page{page-break-after:always;display:flex;align-items:center;justify-content:center;}
+      .page:last-child{page-break-after:auto;}
+      .page img{max-width:100%;max-height:100vh;display:block;}
+      @media print{
+        @page{margin:0;}
+        body{margin:0;}
+        .page{height:100vh;}
+      }
+    </style></head><body><div class="loading">Preparando documentos para imprimir...</div></body></html>`);
+    printWindow.document.close();
+
     try {
-      const merged = await PDFDocument.create();
+      const images: string[] = [];
+
       for (const entry of ready) {
         try {
           const out = await buildModifiedPdf(
@@ -423,9 +447,26 @@ export default function App() {
             entry.password || undefined,
             entry.prices,
           );
-          const src = await PDFDocument.load(out);
-          const copied = await merged.copyPages(src, src.getPageIndices());
-          for (const page of copied) merged.addPage(page);
+          const loadingTask = pdfjs.getDocument({ data: out });
+          const pdf = await loadingTask.promise;
+
+          for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const viewport = page.getViewport({ scale: 2 });
+            const canvas = document.createElement("canvas");
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            const ctx = canvas.getContext("2d");
+            if (!ctx) continue;
+            await page.render({
+              canvasContext: ctx,
+              viewport,
+              canvas,
+            } as Parameters<typeof page.render>[0]).promise;
+            images.push(canvas.toDataURL("image/png"));
+          }
+
+          await pdf.destroy();
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           setGlobalError((prev) =>
@@ -436,41 +477,62 @@ export default function App() {
         }
       }
 
-      if (merged.getPageCount() === 0) {
+      if (images.length === 0) {
+        printWindow.close();
         setGenerating(false);
         return;
       }
 
-      const mergedBytes = await merged.save();
-      const blob = new Blob([mergedBytes as BlobPart], {
-        type: "application/pdf",
-      });
-      const url = URL.createObjectURL(blob);
+      const body = printWindow.document.body;
+      body.innerHTML = "";
+      for (const src of images) {
+        const div = printWindow.document.createElement("div");
+        div.className = "page";
+        const img = printWindow.document.createElement("img");
+        img.src = src;
+        div.appendChild(img);
+        body.appendChild(div);
+      }
 
-      const existing = document.getElementById("print-frame");
-      if (existing) existing.remove();
-
-      const iframe = document.createElement("iframe");
-      iframe.id = "print-frame";
-      iframe.style.position = "fixed";
-      iframe.style.right = "0";
-      iframe.style.bottom = "0";
-      iframe.style.width = "0";
-      iframe.style.height = "0";
-      iframe.style.border = "0";
-      iframe.src = url;
-      iframe.onload = () => {
-        setTimeout(() => {
-          try {
-            iframe.contentWindow?.focus();
-            iframe.contentWindow?.print();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            setGlobalError(`No se pudo abrir la impresión: ${msg}`);
-          }
-        }, 300);
+      const imgs = body.querySelectorAll("img");
+      let loadedCount = 0;
+      const triggerPrint = () => {
+        printWindow.focus();
+        printWindow.print();
       };
-      document.body.appendChild(iframe);
+      if (imgs.length === 0) {
+        triggerPrint();
+      } else {
+        imgs.forEach((img) => {
+          if ((img as HTMLImageElement).complete) {
+            loadedCount++;
+            if (loadedCount === imgs.length) {
+              setTimeout(triggerPrint, 200);
+            }
+          } else {
+            img.addEventListener("load", () => {
+              loadedCount++;
+              if (loadedCount === imgs.length) {
+                setTimeout(triggerPrint, 200);
+              }
+            });
+            img.addEventListener("error", () => {
+              loadedCount++;
+              if (loadedCount === imgs.length) {
+                setTimeout(triggerPrint, 200);
+              }
+            });
+          }
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setGlobalError(`No se pudo abrir la impresión: ${msg}`);
+      try {
+        printWindow.close();
+      } catch {
+        /* noop */
+      }
     } finally {
       setGenerating(false);
     }
