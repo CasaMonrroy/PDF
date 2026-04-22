@@ -17,12 +17,14 @@ type DetectedPrice = {
   fontSize: number;
 };
 
-const PRICE_REGEX = /^\$?\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?$|^\$?\s?\d+$/;
+const PRICE_REGEX =
+  /\$?\s?\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\$?\s?\d{3,}(?:[.,]\d{1,2})?/;
 
 function isPriceLike(s: string) {
   const trimmed = s.trim();
   if (!trimmed) return false;
   if (!/\d/.test(trimmed)) return false;
+  if (/[a-zA-Z]{3,}/.test(trimmed)) return false;
   return PRICE_REGEX.test(trimmed);
 }
 
@@ -38,6 +40,41 @@ async function loadPdfDocument(
   } catch (err) {
     throw err;
   }
+}
+
+type PosItem = {
+  str: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type Row = {
+  y: number;
+  height: number;
+  items: PosItem[];
+  text: string;
+};
+
+function groupIntoRows(items: PosItem[]): Row[] {
+  const sorted = [...items].sort((a, b) => b.y - a.y);
+  const rows: Row[] = [];
+  for (const it of sorted) {
+    const tol = Math.max(it.height * 0.5, 2);
+    let row = rows.find((r) => Math.abs(r.y - it.y) <= tol);
+    if (!row) {
+      row = { y: it.y, height: it.height, items: [], text: "" };
+      rows.push(row);
+    }
+    row.items.push(it);
+    row.height = Math.max(row.height, it.height);
+  }
+  for (const row of rows) {
+    row.items.sort((a, b) => a.x - b.x);
+    row.text = row.items.map((i) => i.str).join(" ").replace(/\s+/g, " ").trim();
+  }
+  return rows;
 }
 
 async function detectPrices(
@@ -61,68 +98,84 @@ async function detectPrices(
       height: number;
     }>;
 
-    type PosItem = {
-      str: string;
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-    };
-
     const positioned: PosItem[] = items
-      .filter((it) => typeof it.str === "string")
+      .filter((it) => typeof it.str === "string" && it.str.trim().length > 0)
       .map((it) => ({
         str: it.str,
         x: it.transform[4],
         y: it.transform[5],
-        width: it.width,
+        width: it.width || 0,
         height: it.height || Math.abs(it.transform[3]) || 10,
       }));
 
-    const primaItems = positioned.filter((it) =>
-      /PRIMA/i.test(it.str.trim()),
-    );
+    const rows = groupIntoRows(positioned);
+    rows.sort((a, b) => b.y - a.y);
 
-    for (const prima of primaItems) {
-      const primaCenterX = prima.x + prima.width / 2;
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r];
+      if (!/PRIMA/i.test(row.text)) continue;
 
-      const candidates = positioned
-        .filter((it) => {
-          if (it === prima) return false;
-          if (it.y >= prima.y) return false;
-          const verticalGap = prima.y - it.y;
-          if (verticalGap > prima.height * 8) return false;
-          const itemCenterX = it.x + it.width / 2;
-          const horizontalDist = Math.abs(itemCenterX - primaCenterX);
-          const maxHorizontal = Math.max(prima.width, it.width) * 1.5 + 30;
-          if (horizontalDist > maxHorizontal) return false;
+      const primaItem = row.items.find((it) => /PRIMA/i.test(it.str));
+      if (!primaItem) continue;
+      const primaCenterX = primaItem.x + primaItem.width / 2;
+
+      const maxRowsBelow = 6;
+      const maxVerticalDistance = row.height * 12;
+
+      let foundForThisPrima = false;
+
+      for (let k = r + 1; k < rows.length && k <= r + maxRowsBelow; k++) {
+        const below = rows[k];
+        if (row.y - below.y > maxVerticalDistance) break;
+
+        const aligned = below.items.filter((it) => {
           if (!isPriceLike(it.str)) return false;
-          return true;
-        })
-        .sort((a, b) => b.y - a.y);
+          const centerX = it.x + it.width / 2;
+          const dist = Math.abs(centerX - primaCenterX);
+          const tolerance =
+            Math.max(primaItem.width, it.width) * 2 + primaItem.height * 4;
+          return dist <= tolerance;
+        });
 
-      if (candidates.length === 0) continue;
+        const anyPrices = below.items.filter((it) => isPriceLike(it.str));
+        const priceCandidates = aligned.length > 0 ? aligned : anyPrices;
 
-      const topY = candidates[0].y;
-      const sameRowTolerance = candidates[0].height * 0.6;
-      const closest = candidates.find(
-        (c) => Math.abs(c.y - topY) <= sameRowTolerance,
-      )!;
+        if (priceCandidates.length === 0) continue;
 
-      const id = `p${p}-${closest.x.toFixed(2)}-${closest.y.toFixed(2)}-${closest.str}`;
-      if (detected.some((d) => d.id === id)) continue;
+        priceCandidates.sort(
+          (a, b) =>
+            Math.abs(a.x + a.width / 2 - primaCenterX) -
+            Math.abs(b.x + b.width / 2 - primaCenterX),
+        );
 
-      detected.push({
-        id,
-        pageIndex: p,
-        originalText: closest.str,
-        newText: closest.str,
-        x: closest.x,
-        y: closest.y,
-        width: closest.width,
-        height: closest.height,
-        fontSize: closest.height,
-      });
+        const closest = priceCandidates[0];
+        const id = `p${p}-${closest.x.toFixed(2)}-${closest.y.toFixed(2)}-${closest.str}`;
+        if (detected.some((d) => d.id === id)) {
+          foundForThisPrima = true;
+          break;
+        }
+
+        detected.push({
+          id,
+          pageIndex: p,
+          originalText: closest.str,
+          newText: closest.str,
+          x: closest.x,
+          y: closest.y,
+          width: closest.width,
+          height: closest.height,
+          fontSize: closest.height,
+        });
+        foundForThisPrima = true;
+        break;
+      }
+
+      if (!foundForThisPrima) {
+        console.warn(
+          `[PRIMA] No se detectó precio debajo de PRIMA en página ${p + 1}. Filas debajo:`,
+          rows.slice(r + 1, r + 7).map((rr) => rr.text),
+        );
+      }
     }
   }
 
