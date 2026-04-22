@@ -408,6 +408,74 @@ export default function App() {
     }
   };
 
+  const printAll = async () => {
+    const ready = pdfs.filter((p) => p.status.kind === "ready");
+    if (ready.length === 0) return;
+    setGenerating(true);
+    setGlobalError(null);
+
+    try {
+      const merged = await PDFDocument.create();
+      for (const entry of ready) {
+        try {
+          const out = await buildModifiedPdf(
+            entry.bytes,
+            entry.password || undefined,
+            entry.prices,
+          );
+          const src = await PDFDocument.load(out);
+          const copied = await merged.copyPages(src, src.getPageIndices());
+          for (const page of copied) merged.addPage(page);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setGlobalError((prev) =>
+            prev
+              ? `${prev}\nError en ${entry.file.name}: ${msg}`
+              : `Error en ${entry.file.name}: ${msg}`,
+          );
+        }
+      }
+
+      if (merged.getPageCount() === 0) {
+        setGenerating(false);
+        return;
+      }
+
+      const mergedBytes = await merged.save();
+      const blob = new Blob([mergedBytes as BlobPart], {
+        type: "application/pdf",
+      });
+      const url = URL.createObjectURL(blob);
+
+      const existing = document.getElementById("print-frame");
+      if (existing) existing.remove();
+
+      const iframe = document.createElement("iframe");
+      iframe.id = "print-frame";
+      iframe.style.position = "fixed";
+      iframe.style.right = "0";
+      iframe.style.bottom = "0";
+      iframe.style.width = "0";
+      iframe.style.height = "0";
+      iframe.style.border = "0";
+      iframe.src = url;
+      iframe.onload = () => {
+        setTimeout(() => {
+          try {
+            iframe.contentWindow?.focus();
+            iframe.contentWindow?.print();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            setGlobalError(`No se pudo abrir la impresión: ${msg}`);
+          }
+        }, 300);
+      };
+      document.body.appendChild(iframe);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
   const downloadAll = async () => {
     const ready = pdfs.filter((p) => p.status.kind === "ready");
     if (ready.length === 0) return;
@@ -644,28 +712,55 @@ export default function App() {
         </div>
 
         {totalReady > 0 && (
-          <button
-            onClick={downloadAll}
-            disabled={generating}
+          <div
             style={{
               marginTop: 24,
-              width: "100%",
-              background: generating ? "#475569" : "var(--accent)",
-              border: "none",
-              color: "white",
-              padding: "14px 20px",
-              borderRadius: 10,
-              fontWeight: 600,
-              cursor: generating ? "wait" : "pointer",
-              fontSize: 15,
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 10,
             }}
           >
-            {generating
-              ? "Generando..."
-              : totalReady === 1
-                ? "Generar y descargar PDF modificado"
-                : `Generar y descargar ${totalReady} PDFs modificados (.zip)`}
-          </button>
+            <button
+              onClick={downloadAll}
+              disabled={generating}
+              style={{
+                background: generating ? "#475569" : "var(--accent)",
+                border: "none",
+                color: "white",
+                padding: "14px 20px",
+                borderRadius: 10,
+                fontWeight: 600,
+                cursor: generating ? "wait" : "pointer",
+                fontSize: 15,
+              }}
+            >
+              {generating
+                ? "Generando..."
+                : totalReady === 1
+                  ? "Descargar PDF modificado"
+                  : `Descargar ${totalReady} PDFs (.zip)`}
+            </button>
+            <button
+              onClick={printAll}
+              disabled={generating}
+              style={{
+                background: generating ? "#475569" : "var(--success)",
+                border: "none",
+                color: "white",
+                padding: "14px 20px",
+                borderRadius: 10,
+                fontWeight: 600,
+                cursor: generating ? "wait" : "pointer",
+                fontSize: 15,
+              }}
+            >
+              {generating
+                ? "Generando..."
+                : totalReady === 1
+                  ? "Imprimir PDF"
+                  : `Imprimir los ${totalReady} PDFs`}
+            </button>
+          </div>
         )}
 
         <footer
