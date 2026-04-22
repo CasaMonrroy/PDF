@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Editor PDF PRIMA"
+version = "1.0.0"
+id = "artifacts/pdf-prima-editor"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25397
+
+[services.development]
+run = "pnpm --filter @workspace/pdf-prima-editor run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/pdf-prima-editor", "run", "build" ]
+publicDir = "artifacts/pdf-prima-editor/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25397"
+BASE_PATH = "/"
