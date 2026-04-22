@@ -82,7 +82,7 @@ async function detectPrices(
   password: string | undefined,
 ): Promise<DetectedPrice[]> {
   const loadingTask = pdfjs.getDocument({
-    data: new Uint8Array(bytes),
+    data: new Uint8Array(bytes.slice(0)),
     password,
   });
   const pdf = await loadingTask.promise;
@@ -216,7 +216,7 @@ async function buildModifiedPdf(
   password: string | undefined,
   prices: DetectedPrice[],
 ): Promise<Uint8Array> {
-  const pdfDoc = await loadPdfDocument(bytes, password);
+  const pdfDoc = await loadPdfDocument(bytes.slice(0), password);
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const pages = pdfDoc.getPages();
 
