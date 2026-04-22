@@ -2,6 +2,7 @@ import { useState, useRef, useCallback } from "react";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import * as pdfjs from "pdfjs-dist";
 import workerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import JSZip from "jszip";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
 
@@ -15,6 +16,21 @@ type DetectedPrice = {
   width: number;
   height: number;
   fontSize: number;
+};
+
+type PdfStatus =
+  | { kind: "loading" }
+  | { kind: "needs-password" }
+  | { kind: "ready" }
+  | { kind: "error"; message: string };
+
+type PdfEntry = {
+  id: string;
+  file: File;
+  bytes: ArrayBuffer;
+  password: string;
+  status: PdfStatus;
+  prices: DetectedPrice[];
 };
 
 const PRICE_REGEX =
@@ -32,14 +48,10 @@ async function loadPdfDocument(
   bytes: ArrayBuffer,
   password: string | undefined,
 ): Promise<PDFDocument> {
-  try {
-    return await PDFDocument.load(bytes, {
-      ignoreEncryption: true,
-      ...(password ? { password } : {}),
-    } as Parameters<typeof PDFDocument.load>[1]);
-  } catch (err) {
-    throw err;
-  }
+  return await PDFDocument.load(bytes, {
+    ignoreEncryption: true,
+    ...(password ? { password } : {}),
+  } as Parameters<typeof PDFDocument.load>[1]);
 }
 
 type PosItem = {
@@ -72,7 +84,11 @@ function groupIntoRows(items: PosItem[]): Row[] {
   }
   for (const row of rows) {
     row.items.sort((a, b) => a.x - b.x);
-    row.text = row.items.map((i) => i.str).join(" ").replace(/\s+/g, " ").trim();
+    row.text = row.items
+      .map((i) => i.str)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
   return rows;
 }
@@ -152,7 +168,11 @@ async function detectPrices(
         foundForThisPrima = true;
       }
 
-      for (let k = r + 1; !foundForThisPrima && k < rows.length && k <= r + maxRowsBelow; k++) {
+      for (
+        let k = r + 1;
+        !foundForThisPrima && k < rows.length && k <= r + maxRowsBelow;
+        k++
+      ) {
         const below = rows[k];
         if (row.y - below.y > maxVerticalDistance) break;
 
@@ -196,13 +216,6 @@ async function detectPrices(
         });
         foundForThisPrima = true;
         break;
-      }
-
-      if (!foundForThisPrima) {
-        console.warn(
-          `[PRIMA] No se detectó precio debajo de PRIMA en página ${p + 1}. Filas debajo:`,
-          rows.slice(r + 1, r + 7).map((rr) => rr.text),
-        );
       }
     }
   }
@@ -260,119 +273,194 @@ async function buildModifiedPdf(
   return await pdfDoc.save({ useObjectStreams: false });
 }
 
-type Status =
-  | { kind: "idle" }
-  | { kind: "loading"; message: string }
-  | { kind: "needs-password" }
-  | { kind: "ready" }
-  | { kind: "error"; message: string };
+let nextId = 0;
+const newId = () => `pdf-${++nextId}`;
 
 export default function App() {
-  const [file, setFile] = useState<File | null>(null);
-  const [bytes, setBytes] = useState<ArrayBuffer | null>(null);
-  const [password, setPassword] = useState("");
-  const [status, setStatus] = useState<Status>({ kind: "idle" });
-  const [prices, setPrices] = useState<DetectedPrice[]>([]);
+  const [pdfs, setPdfs] = useState<PdfEntry[]>([]);
   const [bulkValue, setBulkValue] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [globalError, setGlobalError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const processFile = useCallback(
-    async (raw: ArrayBuffer, pwd: string | undefined) => {
-      setStatus({ kind: "loading", message: "Procesando PDF..." });
+  const updatePdf = useCallback(
+    (id: string, updater: (p: PdfEntry) => PdfEntry) => {
+      setPdfs((prev) => prev.map((p) => (p.id === id ? updater(p) : p)));
+    },
+    [],
+  );
+
+  const processPdf = useCallback(
+    async (id: string, bytes: ArrayBuffer, password: string) => {
       try {
-        const detected = await detectPrices(raw, pwd);
-        setPrices(detected);
-        setBytes(raw);
-        setStatus({ kind: "ready" });
+        const detected = await detectPrices(bytes, password || undefined);
+        updatePdf(id, (p) => ({
+          ...p,
+          status: { kind: "ready" },
+          prices: detected,
+        }));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (
           msg.toLowerCase().includes("password") ||
           msg.toLowerCase().includes("encrypt")
         ) {
-          setBytes(raw);
-          setStatus({ kind: "needs-password" });
+          updatePdf(id, (p) => ({
+            ...p,
+            status: { kind: "needs-password" },
+          }));
         } else {
-          setStatus({
-            kind: "error",
-            message: `No se pudo procesar el PDF: ${msg}`,
-          });
+          updatePdf(id, (p) => ({
+            ...p,
+            status: { kind: "error", message: msg },
+          }));
         }
       }
     },
-    [],
+    [updatePdf],
   );
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    setFile(f);
-    setPassword("");
-    setPrices([]);
-    const buf = await f.arrayBuffer();
-    await processFile(buf, undefined);
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    setGlobalError(null);
+
+    const newEntries: PdfEntry[] = [];
+    for (const file of Array.from(files)) {
+      const buf = await file.arrayBuffer();
+      newEntries.push({
+        id: newId(),
+        file,
+        bytes: buf,
+        password: "",
+        status: { kind: "loading" },
+        prices: [],
+      });
+    }
+
+    setPdfs((prev) => [...prev, ...newEntries]);
+
+    for (const entry of newEntries) {
+      processPdf(entry.id, entry.bytes, "");
+    }
+
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const handlePasswordSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!bytes) return;
-    await processFile(bytes, password);
+  const submitPassword = async (id: string) => {
+    const entry = pdfs.find((p) => p.id === id);
+    if (!entry) return;
+    updatePdf(id, (p) => ({ ...p, status: { kind: "loading" } }));
+    await processPdf(id, entry.bytes, entry.password);
   };
 
-  const handleDownload = async () => {
-    if (!bytes || !file) return;
-    setStatus({ kind: "loading", message: "Generando PDF modificado..." });
+  const updatePrice = (pdfId: string, priceId: string, value: string) => {
+    updatePdf(pdfId, (p) => ({
+      ...p,
+      prices: p.prices.map((pr) =>
+        pr.id === priceId ? { ...pr, newText: value } : pr,
+      ),
+    }));
+  };
+
+  const applyBulkToAll = () => {
+    if (!bulkValue.trim()) return;
+    setPdfs((prev) =>
+      prev.map((p) => ({
+        ...p,
+        prices: p.prices.map((pr) => ({ ...pr, newText: bulkValue })),
+      })),
+    );
+  };
+
+  const removePdf = (id: string) => {
+    setPdfs((prev) => prev.filter((p) => p.id !== id));
+  };
+
+  const removeAll = () => {
+    setPdfs([]);
+    setGlobalError(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const downloadOne = async (id: string) => {
+    const entry = pdfs.find((p) => p.id === id);
+    if (!entry || entry.status.kind !== "ready") return;
+    setGlobalError(null);
     try {
       const out = await buildModifiedPdf(
-        bytes,
-        password || undefined,
-        prices,
+        entry.bytes,
+        entry.password || undefined,
+        entry.prices,
       );
       const blob = new Blob([out as BlobPart], { type: "application/pdf" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      const baseName = file.name.replace(/\.pdf$/i, "");
-      a.download = `${baseName}-modificado.pdf`;
+      a.download = `${entry.file.name.replace(/\.pdf$/i, "")}-modificado.pdf`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      setStatus({ kind: "ready" });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setStatus({
-        kind: "error",
-        message: `Error al generar el PDF: ${msg}`,
-      });
+      setGlobalError(`Error en ${entry.file.name}: ${msg}`);
     }
   };
 
-  const updatePrice = (id: string, value: string) => {
-    setPrices((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, newText: value } : p)),
-    );
+  const downloadAll = async () => {
+    const ready = pdfs.filter((p) => p.status.kind === "ready");
+    if (ready.length === 0) return;
+    setGenerating(true);
+    setGlobalError(null);
+
+    try {
+      if (ready.length === 1) {
+        await downloadOne(ready[0].id);
+        setGenerating(false);
+        return;
+      }
+
+      const zip = new JSZip();
+      for (const entry of ready) {
+        try {
+          const out = await buildModifiedPdf(
+            entry.bytes,
+            entry.password || undefined,
+            entry.prices,
+          );
+          const name = `${entry.file.name.replace(/\.pdf$/i, "")}-modificado.pdf`;
+          zip.file(name, out);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setGlobalError((prev) =>
+            prev
+              ? `${prev}\nError en ${entry.file.name}: ${msg}`
+              : `Error en ${entry.file.name}: ${msg}`,
+          );
+        }
+      }
+      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `pdfs-modificados-${Date.now()}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } finally {
+      setGenerating(false);
+    }
   };
 
-  const applyBulk = () => {
-    if (!bulkValue.trim()) return;
-    setPrices((prev) => prev.map((p) => ({ ...p, newText: bulkValue })));
-  };
-
-  const reset = () => {
-    setFile(null);
-    setBytes(null);
-    setPassword("");
-    setPrices([]);
-    setStatus({ kind: "idle" });
-    setBulkValue("");
-    if (fileInputRef.current) fileInputRef.current.value = "";
-  };
+  const totalReady = pdfs.filter((p) => p.status.kind === "ready").length;
+  const totalPrices = pdfs.reduce((sum, p) => sum + p.prices.length, 0);
 
   return (
     <div style={{ minHeight: "100vh", padding: "32px 16px" }}>
-      <div style={{ maxWidth: 880, margin: "0 auto" }}>
-        <header style={{ marginBottom: 32 }}>
+      <div style={{ maxWidth: 960, margin: "0 auto" }}>
+        <header style={{ marginBottom: 24 }}>
           <h1
             style={{
               fontSize: 32,
@@ -391,9 +479,10 @@ export default function App() {
               lineHeight: 1.5,
             }}
           >
-            Sube un PDF y modifica únicamente los precios que aparecen
-            inmediatamente debajo de la palabra <strong>PRIMA</strong>. Si el
-            PDF tiene restricciones, se desbloquea automáticamente.
+            Sube uno o varios PDFs (hasta los que quieras a la vez) y modifica
+            únicamente el precio que aparece <strong>al lado o debajo</strong>{" "}
+            de la palabra <strong>PRIMA</strong>. Los PDFs con restricciones se
+            desbloquean automáticamente.
           </p>
         </header>
 
@@ -417,12 +506,13 @@ export default function App() {
               letterSpacing: "0.05em",
             }}
           >
-            1. Selecciona un PDF
+            1. Selecciona uno o varios PDFs
           </label>
           <input
             ref={fileInputRef}
             type="file"
             accept="application/pdf,.pdf"
+            multiple
             onChange={handleFileChange}
             style={{
               display: "block",
@@ -436,22 +526,25 @@ export default function App() {
               cursor: "pointer",
             }}
           />
-          {file && (
+          {pdfs.length > 0 && (
             <div
               style={{
-                marginTop: 12,
-                fontSize: 13,
-                color: "var(--muted)",
+                marginTop: 14,
                 display: "flex",
                 justifyContent: "space-between",
                 alignItems: "center",
+                fontSize: 13,
+                color: "var(--muted)",
               }}
             >
               <span>
-                Archivo: <strong style={{ color: "var(--text)" }}>{file.name}</strong>
+                {pdfs.length} PDF{pdfs.length === 1 ? "" : "s"} cargado
+                {pdfs.length === 1 ? "" : "s"} · {totalPrices} precio
+                {totalPrices === 1 ? "" : "s"} detectado
+                {totalPrices === 1 ? "" : "s"}
               </span>
               <button
-                onClick={reset}
+                onClick={removeAll}
                 style={{
                   background: "transparent",
                   border: "1px solid var(--border)",
@@ -462,273 +555,117 @@ export default function App() {
                   fontSize: 12,
                 }}
               >
-                Limpiar
+                Quitar todos
               </button>
             </div>
           )}
         </section>
 
-        {status.kind === "needs-password" && (
+        {pdfs.length > 0 && totalPrices > 0 && (
           <section
             style={{
               background: "var(--panel)",
               border: "1px solid var(--border)",
               borderRadius: 12,
-              padding: 24,
+              padding: 20,
               marginBottom: 20,
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
             }}
           >
-            <form onSubmit={handlePasswordSubmit}>
-              <label
-                style={{
-                  display: "block",
-                  fontSize: 13,
-                  fontWeight: 600,
-                  marginBottom: 10,
-                  color: "var(--muted)",
-                  textTransform: "uppercase",
-                  letterSpacing: "0.05em",
-                }}
-              >
-                Este PDF requiere contraseña
-              </label>
-              <div style={{ display: "flex", gap: 8 }}>
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Contraseña del PDF"
-                  style={{
-                    flex: 1,
-                    padding: "10px 12px",
-                    borderRadius: 8,
-                    border: "1px solid var(--border)",
-                    background: "#0f172a",
-                    color: "var(--text)",
-                    fontSize: 14,
-                  }}
-                />
-                <button
-                  type="submit"
-                  style={{
-                    background: "var(--accent)",
-                    border: "none",
-                    color: "white",
-                    padding: "10px 20px",
-                    borderRadius: 8,
-                    fontWeight: 600,
-                    cursor: "pointer",
-                    fontSize: 14,
-                  }}
-                >
-                  Desbloquear
-                </button>
-              </div>
-            </form>
+            <input
+              type="text"
+              value={bulkValue}
+              onChange={(e) => setBulkValue(e.target.value)}
+              placeholder="Aplicar el mismo precio a todos los PDFs"
+              style={{
+                flex: 1,
+                padding: "10px 12px",
+                borderRadius: 8,
+                border: "1px solid var(--border)",
+                background: "#0f172a",
+                color: "var(--text)",
+                fontSize: 14,
+              }}
+            />
+            <button
+              onClick={applyBulkToAll}
+              style={{
+                background: "transparent",
+                border: "1px solid var(--border)",
+                color: "var(--text)",
+                padding: "10px 16px",
+                borderRadius: 8,
+                cursor: "pointer",
+                fontSize: 13,
+                fontWeight: 500,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Aplicar a todos
+            </button>
           </section>
         )}
 
-        {status.kind === "loading" && (
+        {globalError && (
           <div
             style={{
-              padding: 16,
-              background: "var(--panel)",
-              border: "1px solid var(--border)",
-              borderRadius: 12,
-              marginBottom: 20,
-              color: "var(--muted)",
-              fontSize: 14,
-            }}
-          >
-            {status.message}
-          </div>
-        )}
-
-        {status.kind === "error" && (
-          <div
-            style={{
-              padding: 16,
+              padding: 14,
               background: "rgba(239,68,68,0.08)",
               border: "1px solid var(--danger)",
               borderRadius: 12,
               marginBottom: 20,
               color: "var(--danger)",
-              fontSize: 14,
+              fontSize: 13,
+              whiteSpace: "pre-wrap",
             }}
           >
-            {status.message}
+            {globalError}
           </div>
         )}
 
-        {status.kind === "ready" && (
-          <section
+        <div style={{ display: "grid", gap: 14 }}>
+          {pdfs.map((entry) => (
+            <PdfCard
+              key={entry.id}
+              entry={entry}
+              onPasswordChange={(value) =>
+                updatePdf(entry.id, (p) => ({ ...p, password: value }))
+              }
+              onSubmitPassword={() => submitPassword(entry.id)}
+              onPriceChange={(priceId, value) =>
+                updatePrice(entry.id, priceId, value)
+              }
+              onRemove={() => removePdf(entry.id)}
+              onDownload={() => downloadOne(entry.id)}
+            />
+          ))}
+        </div>
+
+        {totalReady > 0 && (
+          <button
+            onClick={downloadAll}
+            disabled={generating}
             style={{
-              background: "var(--panel)",
-              border: "1px solid var(--border)",
-              borderRadius: 12,
-              padding: 24,
-              marginBottom: 20,
+              marginTop: 24,
+              width: "100%",
+              background: generating ? "#475569" : "var(--accent)",
+              border: "none",
+              color: "white",
+              padding: "14px 20px",
+              borderRadius: 10,
+              fontWeight: 600,
+              cursor: generating ? "wait" : "pointer",
+              fontSize: 15,
             }}
           >
-            <label
-              style={{
-                display: "block",
-                fontSize: 13,
-                fontWeight: 600,
-                marginBottom: 10,
-                color: "var(--muted)",
-                textTransform: "uppercase",
-                letterSpacing: "0.05em",
-              }}
-            >
-              2. Precios encontrados debajo de "PRIMA"
-            </label>
-
-            {prices.length === 0 ? (
-              <p
-                style={{
-                  color: "var(--muted)",
-                  fontSize: 14,
-                  margin: "12px 0 0",
-                }}
-              >
-                No se detectaron precios debajo de la palabra "PRIMA" en este
-                PDF.
-              </p>
-            ) : (
-              <>
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 8,
-                    marginBottom: 16,
-                    paddingBottom: 16,
-                    borderBottom: "1px solid var(--border)",
-                  }}
-                >
-                  <input
-                    type="text"
-                    value={bulkValue}
-                    onChange={(e) => setBulkValue(e.target.value)}
-                    placeholder="Aplicar el mismo valor a todos (opcional)"
-                    style={{
-                      flex: 1,
-                      padding: "8px 12px",
-                      borderRadius: 8,
-                      border: "1px solid var(--border)",
-                      background: "#0f172a",
-                      color: "var(--text)",
-                      fontSize: 14,
-                    }}
-                  />
-                  <button
-                    onClick={applyBulk}
-                    style={{
-                      background: "transparent",
-                      border: "1px solid var(--border)",
-                      color: "var(--text)",
-                      padding: "8px 14px",
-                      borderRadius: 8,
-                      cursor: "pointer",
-                      fontSize: 13,
-                      fontWeight: 500,
-                    }}
-                  >
-                    Aplicar a todos
-                  </button>
-                </div>
-
-                <div style={{ display: "grid", gap: 10 }}>
-                  {prices.map((p, idx) => (
-                    <div
-                      key={p.id}
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "auto 1fr auto 1fr",
-                        gap: 12,
-                        alignItems: "center",
-                        padding: "10px 12px",
-                        background: "#0f172a",
-                        border: "1px solid var(--border)",
-                        borderRadius: 8,
-                      }}
-                    >
-                      <span
-                        style={{
-                          fontSize: 12,
-                          color: "var(--muted)",
-                          fontWeight: 600,
-                          minWidth: 28,
-                        }}
-                      >
-                        #{idx + 1}
-                      </span>
-                      <div>
-                        <div
-                          style={{
-                            fontSize: 11,
-                            color: "var(--muted)",
-                            marginBottom: 2,
-                          }}
-                        >
-                          Original (pág. {p.pageIndex + 1})
-                        </div>
-                        <div
-                          style={{
-                            fontFamily: "monospace",
-                            fontSize: 14,
-                            color: "var(--text)",
-                          }}
-                        >
-                          {p.originalText}
-                        </div>
-                      </div>
-                      <span style={{ color: "var(--muted)" }}>→</span>
-                      <input
-                        type="text"
-                        value={p.newText}
-                        onChange={(e) => updatePrice(p.id, e.target.value)}
-                        style={{
-                          padding: "8px 10px",
-                          borderRadius: 6,
-                          border: "1px solid var(--border)",
-                          background: "var(--panel)",
-                          color: "var(--text)",
-                          fontSize: 14,
-                          fontFamily: "monospace",
-                          width: "100%",
-                        }}
-                      />
-                    </div>
-                  ))}
-                </div>
-
-                <button
-                  onClick={handleDownload}
-                  style={{
-                    marginTop: 20,
-                    width: "100%",
-                    background: "var(--accent)",
-                    border: "none",
-                    color: "white",
-                    padding: "12px 20px",
-                    borderRadius: 8,
-                    fontWeight: 600,
-                    cursor: "pointer",
-                    fontSize: 15,
-                  }}
-                  onMouseOver={(e) =>
-                    (e.currentTarget.style.background = "var(--accent-hover)")
-                  }
-                  onMouseOut={(e) =>
-                    (e.currentTarget.style.background = "var(--accent)")
-                  }
-                >
-                  Generar y descargar PDF modificado
-                </button>
-              </>
-            )}
-          </section>
+            {generating
+              ? "Generando..."
+              : totalReady === 1
+                ? "Generar y descargar PDF modificado"
+                : `Generar y descargar ${totalReady} PDFs modificados (.zip)`}
+          </button>
         )}
 
         <footer
@@ -744,6 +681,248 @@ export default function App() {
           envían a ningún servidor.
         </footer>
       </div>
+    </div>
+  );
+}
+
+function PdfCard({
+  entry,
+  onPasswordChange,
+  onSubmitPassword,
+  onPriceChange,
+  onRemove,
+  onDownload,
+}: {
+  entry: PdfEntry;
+  onPasswordChange: (value: string) => void;
+  onSubmitPassword: () => void;
+  onPriceChange: (priceId: string, value: string) => void;
+  onRemove: () => void;
+  onDownload: () => void;
+}) {
+  const { file, status, prices } = entry;
+
+  return (
+    <div
+      style={{
+        background: "var(--panel)",
+        border: "1px solid var(--border)",
+        borderRadius: 12,
+        padding: 20,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          gap: 12,
+          marginBottom: 14,
+        }}
+      >
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div
+            style={{
+              fontWeight: 600,
+              fontSize: 15,
+              wordBreak: "break-all",
+            }}
+          >
+            {file.name}
+          </div>
+          <div
+            style={{
+              fontSize: 12,
+              color: "var(--muted)",
+              marginTop: 4,
+            }}
+          >
+            {(file.size / 1024).toFixed(1)} KB
+            {status.kind === "ready" && (
+              <>
+                {" · "}
+                {prices.length} precio{prices.length === 1 ? "" : "s"} detectado
+                {prices.length === 1 ? "" : "s"}
+              </>
+            )}
+            {status.kind === "loading" && " · Procesando..."}
+            {status.kind === "needs-password" && " · Requiere contraseña"}
+            {status.kind === "error" && " · Error"}
+          </div>
+        </div>
+        <button
+          onClick={onRemove}
+          style={{
+            background: "transparent",
+            border: "1px solid var(--border)",
+            color: "var(--muted)",
+            padding: "4px 10px",
+            borderRadius: 6,
+            cursor: "pointer",
+            fontSize: 12,
+          }}
+        >
+          Quitar
+        </button>
+      </div>
+
+      {status.kind === "needs-password" && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            onSubmitPassword();
+          }}
+          style={{ display: "flex", gap: 8, marginBottom: 8 }}
+        >
+          <input
+            type="password"
+            value={entry.password}
+            onChange={(e) => onPasswordChange(e.target.value)}
+            placeholder="Contraseña del PDF"
+            style={{
+              flex: 1,
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "1px solid var(--border)",
+              background: "#0f172a",
+              color: "var(--text)",
+              fontSize: 14,
+            }}
+          />
+          <button
+            type="submit"
+            style={{
+              background: "var(--accent)",
+              border: "none",
+              color: "white",
+              padding: "8px 16px",
+              borderRadius: 8,
+              fontWeight: 600,
+              cursor: "pointer",
+              fontSize: 13,
+            }}
+          >
+            Desbloquear
+          </button>
+        </form>
+      )}
+
+      {status.kind === "error" && (
+        <div
+          style={{
+            padding: 10,
+            background: "rgba(239,68,68,0.08)",
+            border: "1px solid var(--danger)",
+            borderRadius: 8,
+            color: "var(--danger)",
+            fontSize: 13,
+          }}
+        >
+          {status.message}
+        </div>
+      )}
+
+      {status.kind === "ready" && prices.length === 0 && (
+        <div
+          style={{
+            padding: 10,
+            background: "rgba(148,163,184,0.08)",
+            border: "1px solid var(--border)",
+            borderRadius: 8,
+            color: "var(--muted)",
+            fontSize: 13,
+          }}
+        >
+          No se detectaron precios al lado o debajo de "PRIMA" en este PDF.
+        </div>
+      )}
+
+      {status.kind === "ready" && prices.length > 0 && (
+        <>
+          <div style={{ display: "grid", gap: 8 }}>
+            {prices.map((p, idx) => (
+              <div
+                key={p.id}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "auto 1fr auto 1fr",
+                  gap: 10,
+                  alignItems: "center",
+                  padding: "8px 10px",
+                  background: "#0f172a",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: "var(--muted)",
+                    fontWeight: 600,
+                    minWidth: 24,
+                  }}
+                >
+                  #{idx + 1}
+                </span>
+                <div style={{ minWidth: 0 }}>
+                  <div
+                    style={{
+                      fontSize: 10,
+                      color: "var(--muted)",
+                      marginBottom: 2,
+                    }}
+                  >
+                    Original (pág. {p.pageIndex + 1})
+                  </div>
+                  <div
+                    style={{
+                      fontFamily: "monospace",
+                      fontSize: 13,
+                      color: "var(--text)",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {p.originalText}
+                  </div>
+                </div>
+                <span style={{ color: "var(--muted)" }}>→</span>
+                <input
+                  type="text"
+                  value={p.newText}
+                  onChange={(e) => onPriceChange(p.id, e.target.value)}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 6,
+                    border: "1px solid var(--border)",
+                    background: "var(--panel)",
+                    color: "var(--text)",
+                    fontSize: 13,
+                    fontFamily: "monospace",
+                    width: "100%",
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+          <button
+            onClick={onDownload}
+            style={{
+              marginTop: 12,
+              background: "transparent",
+              border: "1px solid var(--accent)",
+              color: "var(--accent)",
+              padding: "8px 14px",
+              borderRadius: 8,
+              cursor: "pointer",
+              fontSize: 13,
+              fontWeight: 500,
+            }}
+          >
+            Descargar este PDF modificado
+          </button>
+        </>
+      )}
     </div>
   );
 }
