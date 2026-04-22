@@ -124,7 +124,35 @@ async function detectPrices(
 
       let foundForThisPrima = false;
 
-      for (let k = r + 1; k < rows.length && k <= r + maxRowsBelow; k++) {
+      const besideCandidates = row.items.filter((it) => {
+        if (it === primaItem) return false;
+        if (!isPriceLike(it.str)) return false;
+        if (it.x < primaItem.x + primaItem.width - 1) return false;
+        const horizontalGap = it.x - (primaItem.x + primaItem.width);
+        return horizontalGap <= primaItem.height * 20;
+      });
+
+      if (besideCandidates.length > 0) {
+        besideCandidates.sort((a, b) => a.x - b.x);
+        const beside = besideCandidates[0];
+        const id = `p${p}-${beside.x.toFixed(2)}-${beside.y.toFixed(2)}-${beside.str}`;
+        if (!detected.some((d) => d.id === id)) {
+          detected.push({
+            id,
+            pageIndex: p,
+            originalText: beside.str,
+            newText: beside.str,
+            x: beside.x,
+            y: beside.y,
+            width: beside.width,
+            height: beside.height,
+            fontSize: beside.height,
+          });
+        }
+        foundForThisPrima = true;
+      }
+
+      for (let k = r + 1; !foundForThisPrima && k < rows.length && k <= r + maxRowsBelow; k++) {
         const below = rows[k];
         if (row.y - below.y > maxVerticalDistance) break;
 
