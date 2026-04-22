@@ -5,14 +5,6 @@ import workerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
 
-type FontFamily = "helvetica" | "times" | "courier";
-
-type FontStyle = {
-  family: FontFamily;
-  bold: boolean;
-  italic: boolean;
-};
-
 type DetectedPrice = {
   id: string;
   pageIndex: number;
@@ -23,40 +15,7 @@ type DetectedPrice = {
   width: number;
   height: number;
   fontSize: number;
-  font: FontStyle;
 };
-
-function classifyFont(fontFamilyOrName: string | undefined): FontStyle {
-  const s = (fontFamilyOrName || "").toLowerCase();
-  let family: FontFamily = "helvetica";
-  if (/times|serif|roman|garamond|georgia|cambria|book/.test(s)) {
-    family = "times";
-  } else if (/courier|mono|consol|menlo/.test(s)) {
-    family = "courier";
-  }
-  const bold = /bold|black|heavy|semibold|demibold/.test(s);
-  const italic = /italic|oblique/.test(s);
-  return { family, bold, italic };
-}
-
-function pickStandardFont(style: FontStyle): StandardFonts {
-  if (style.family === "times") {
-    if (style.bold && style.italic) return StandardFonts.TimesRomanBoldItalic;
-    if (style.bold) return StandardFonts.TimesRomanBold;
-    if (style.italic) return StandardFonts.TimesRomanItalic;
-    return StandardFonts.TimesRoman;
-  }
-  if (style.family === "courier") {
-    if (style.bold && style.italic) return StandardFonts.CourierBoldOblique;
-    if (style.bold) return StandardFonts.CourierBold;
-    if (style.italic) return StandardFonts.CourierOblique;
-    return StandardFonts.Courier;
-  }
-  if (style.bold && style.italic) return StandardFonts.HelveticaBoldOblique;
-  if (style.bold) return StandardFonts.HelveticaBold;
-  if (style.italic) return StandardFonts.HelveticaOblique;
-  return StandardFonts.Helvetica;
-}
 
 const PRICE_REGEX =
   /\$?\s?\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\$?\s?\d{3,}(?:[.,]\d{1,2})?/;
@@ -89,7 +48,6 @@ type PosItem = {
   y: number;
   width: number;
   height: number;
-  font: FontStyle;
 };
 
 type Row = {
@@ -138,28 +96,17 @@ async function detectPrices(
       transform: number[];
       width: number;
       height: number;
-      fontName?: string;
     }>;
-    const styles = (content.styles ?? {}) as Record<
-      string,
-      { fontFamily?: string }
-    >;
 
     const positioned: PosItem[] = items
       .filter((it) => typeof it.str === "string" && it.str.trim().length > 0)
-      .map((it) => {
-        const fontName = it.fontName || "";
-        const fontFamily = styles[fontName]?.fontFamily || "";
-        const font = classifyFont(`${fontFamily} ${fontName}`);
-        return {
-          str: it.str,
-          x: it.transform[4],
-          y: it.transform[5],
-          width: it.width || 0,
-          height: it.height || Math.abs(it.transform[3]) || 10,
-          font,
-        };
-      });
+      .map((it) => ({
+        str: it.str,
+        x: it.transform[4],
+        y: it.transform[5],
+        width: it.width || 0,
+        height: it.height || Math.abs(it.transform[3]) || 10,
+      }));
 
     const rows = groupIntoRows(positioned);
     rows.sort((a, b) => b.y - a.y);
@@ -200,7 +147,6 @@ async function detectPrices(
             width: beside.width,
             height: beside.height,
             fontSize: beside.height,
-            font: beside.font,
           });
         }
         foundForThisPrima = true;
@@ -247,7 +193,6 @@ async function detectPrices(
           width: closest.width,
           height: closest.height,
           fontSize: closest.height,
-          font: closest.font,
         });
         foundForThisPrima = true;
         break;
@@ -272,28 +217,13 @@ async function buildModifiedPdf(
   prices: DetectedPrice[],
 ): Promise<Uint8Array> {
   const pdfDoc = await loadPdfDocument(bytes.slice(0), password);
-  const fontCache = new Map<
-    StandardFonts,
-    Awaited<ReturnType<typeof pdfDoc.embedFont>>
-  >();
-  const getFont = async (style: FontStyle) => {
-    const key = pickStandardFont(style);
-    let f = fontCache.get(key);
-    if (!f) {
-      f = await pdfDoc.embedFont(key);
-      fontCache.set(key, f);
-    }
-    return f;
-  };
-
+  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const pages = pdfDoc.getPages();
 
   for (const price of prices) {
     if (price.newText === price.originalText) continue;
     const page = pages[price.pageIndex];
     if (!page) continue;
-
-    const font = await getFont(price.font);
 
     const padX = 1;
     const padY = price.fontSize * 0.18;
@@ -311,18 +241,18 @@ async function buildModifiedPdf(
     });
 
     let drawSize = price.fontSize;
-    let textWidth = font.widthOfTextAtSize(price.newText, drawSize);
+    let textWidth = helvetica.widthOfTextAtSize(price.newText, drawSize);
     const maxWidth = price.width + 6;
     while (textWidth > maxWidth && drawSize > 4) {
       drawSize -= 0.5;
-      textWidth = font.widthOfTextAtSize(price.newText, drawSize);
+      textWidth = helvetica.widthOfTextAtSize(price.newText, drawSize);
     }
 
     page.drawText(price.newText, {
       x: price.x,
       y: price.y,
       size: drawSize,
-      font,
+      font: helvetica,
       color: rgb(0, 0, 0),
     });
   }
