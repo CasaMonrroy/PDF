@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "pnpm install --frozen-lockfile=false",
+  "buildCommand": "BASE_PATH=/ PORT=3000 pnpm --filter @workspace/pdf-prima-editor run build",
+  "outputDirectory": "artifacts/pdf-prima-editor/dist/public",
+  "framework": null,
+  "trailingSlash": false
+}
