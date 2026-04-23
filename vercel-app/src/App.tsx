@@ -414,29 +414,6 @@ export default function App() {
     setGenerating(true);
     setGlobalError(null);
 
-    const printWindow = window.open("", "_blank");
-    if (!printWindow) {
-      setGenerating(false);
-      setGlobalError(
-        "El navegador bloqueó la ventana de impresión. Permite las ventanas emergentes para este sitio e inténtalo de nuevo.",
-      );
-      return;
-    }
-
-    printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>Imprimir PDFs</title><style>
-      html,body{margin:0;padding:0;background:#fff;font-family:-apple-system,sans-serif;}
-      .loading{padding:40px;text-align:center;color:#666;}
-      .page{page-break-after:always;display:flex;align-items:center;justify-content:center;}
-      .page:last-child{page-break-after:auto;}
-      .page img{max-width:100%;max-height:100vh;display:block;}
-      @media print{
-        @page{margin:0;}
-        body{margin:0;}
-        .page{height:100vh;}
-      }
-    </style></head><body><div class="loading">Preparando documentos para imprimir...</div></body></html>`);
-    printWindow.document.close();
-
     try {
       const images: string[] = [];
 
@@ -478,17 +455,51 @@ export default function App() {
       }
 
       if (images.length === 0) {
-        printWindow.close();
         setGenerating(false);
         return;
       }
 
-      const body = printWindow.document.body;
-      body.innerHTML = "";
+      const existing = document.getElementById("print-frame");
+      if (existing) existing.remove();
+
+      const iframe = document.createElement("iframe");
+      iframe.id = "print-frame";
+      iframe.style.position = "fixed";
+      iframe.style.right = "0";
+      iframe.style.bottom = "0";
+      iframe.style.width = "0";
+      iframe.style.height = "0";
+      iframe.style.border = "0";
+      iframe.style.visibility = "hidden";
+      document.body.appendChild(iframe);
+
+      const doc = iframe.contentDocument;
+      const win = iframe.contentWindow;
+      if (!doc || !win) {
+        setGlobalError("No se pudo preparar la impresión.");
+        setGenerating(false);
+        return;
+      }
+
+      doc.open();
+      doc.write(`<!doctype html><html><head><meta charset="utf-8"><title>Imprimir</title><style>
+        html,body{margin:0;padding:0;background:#fff;}
+        .page{page-break-after:always;display:flex;align-items:center;justify-content:center;}
+        .page:last-child{page-break-after:auto;}
+        .page img{max-width:100%;max-height:100vh;display:block;}
+        @media print{
+          @page{margin:0;}
+          body{margin:0;}
+          .page{height:100vh;}
+        }
+      </style></head><body></body></html>`);
+      doc.close();
+
+      const body = doc.body;
       for (const src of images) {
-        const div = printWindow.document.createElement("div");
+        const div = doc.createElement("div");
         div.className = "page";
-        const img = printWindow.document.createElement("img");
+        const img = doc.createElement("img");
         img.src = src;
         div.appendChild(img);
         body.appendChild(div);
@@ -497,8 +508,13 @@ export default function App() {
       const imgs = body.querySelectorAll("img");
       let loadedCount = 0;
       const triggerPrint = () => {
-        printWindow.focus();
-        printWindow.print();
+        try {
+          win.focus();
+          win.print();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setGlobalError(`No se pudo abrir la impresión: ${msg}`);
+        }
       };
       if (imgs.length === 0) {
         triggerPrint();
@@ -528,11 +544,6 @@ export default function App() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setGlobalError(`No se pudo abrir la impresión: ${msg}`);
-      try {
-        printWindow.close();
-      } catch {
-        /* noop */
-      }
     } finally {
       setGenerating(false);
     }
