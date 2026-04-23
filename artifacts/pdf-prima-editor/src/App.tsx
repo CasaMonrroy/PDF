@@ -609,9 +609,7 @@ export default function App() {
               margin: 0,
               letterSpacing: "-0.02em",
             }}
-          >
-            Editor de PDF — PRIMA
-          </h1>
+          >SOAP EDITOR</h1>
           <p
             style={{
               color: "var(--muted)",
