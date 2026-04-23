@@ -6,15 +6,14 @@ Standalone, self-contained version of the app ready to deploy on Vercel via GitH
 
 1. Push this repo to GitHub.
 2. In Vercel, click **Add New → Project** and import the repository.
-3. In the **Configure Project** step, set:
-   - **Root Directory**: `vercel-app`
-   - **Framework Preset**: Vite (auto-detected)
-   - **Build Command**: `npm run build` (default)
-   - **Output Directory**: `dist` (default)
-   - **Install Command**: `npm install` (default)
-4. Click **Deploy**.
+3. **Just click Deploy.** No configuration needed.
 
-That's it. No environment variables required.
+The root `vercel.json` and `.vercelignore` files tell Vercel to:
+- Ignore the Replit monorepo files (pnpm workspace, lockfile, etc.)
+- Install and build from the `vercel-app/` folder using npm
+- Serve `vercel-app/dist` as the output
+
+No environment variables required.
 
 ## Local development
 

@@ -1,0 +1,13 @@
+node_modules
+artifacts
+lib
+scripts
+.local
+attached_assets
+.cache
+.expo
+pnpm-lock.yaml
+pnpm-workspace.yaml
+.replit
+.replitignore
+replit.md
